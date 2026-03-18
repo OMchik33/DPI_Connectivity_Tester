@@ -1,4 +1,4 @@
-# DPI Connectivity Tester (GUI)
+# Connectivity Tester (GUI)
 
 [![Release](https://img.shields.io/github/v/release/OMchik33/DPI_Connectivity_Tester)](https://github.com/OMchik33/DPI_Connectivity_Tester/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](#-license)

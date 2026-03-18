@@ -35,7 +35,7 @@ visualization.
 
 ## 🖼️ Interface Preview
 
-`<img width="1219" height="881" alt="image" src="https://github.com/user-attachments/assets/3050f5c8-dec7-461b-bd05-2e17c4c2b70d" />`{=html}
+<img width="1219" height="881" alt="image" src="https://github.com/user-attachments/assets/3050f5c8-dec7-461b-bd05-2e17c4c2b70d" />
 
 ------------------------------------------------------------------------
 

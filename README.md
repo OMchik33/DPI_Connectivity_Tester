@@ -154,7 +154,7 @@ Hover over results to see:
 ## ⚙️ Build EXE
 
 ```
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name DPIConnectivityTester tester_gui_5.3.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name DPIConnectivityTester main.py
 ```
 
 ---

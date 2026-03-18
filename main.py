@@ -18,8 +18,8 @@ import requests
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_TITLE = "DPI & Connectivity Tester"
-APP_VERSION = "v5.4"
+APP_TITLE = "Connectivity Tester"
+APP_VERSION = "v5.5"
 TIMEOUT = 10
 MAX_WORKERS = 4
 USER_AGENT = (

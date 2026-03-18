@@ -145,7 +145,7 @@ https://site.com/file.ext
 ## ⚙️ Сборка EXE
 
 ```
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name DPIConnectivityTester tester3_gui_v6.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name DPIConnectivityTester tester_gui_5.3.py
 ```
 
 ---

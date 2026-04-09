@@ -15,6 +15,7 @@ env:
   APP_NAME: DPIConnectivityTester
   APP_VERSION: 5.4
   MAIN_FILE: main.py
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-windows-exe:
@@ -22,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.13'
           cache: 'pip'
@@ -53,7 +54,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onefile --windowed --name "${{ env.EXE_NAME }}" "${{ env.MAIN_FILE }}"
 
       - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.EXE_NAME }}-windows
           path: dist/${{ env.EXE_NAME }}.exe

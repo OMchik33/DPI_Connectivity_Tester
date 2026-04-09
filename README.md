@@ -1,7 +1,6 @@
 # Connectivity Tester (GUI)
 
 [![Release](https://img.shields.io/github/v/release/OMchik33/DPI_Connectivity_Tester)](https://github.com/OMchik33/DPI_Connectivity_Tester/releases)
-[![License](https://img.shields.io/badge/license-MIT-green)](#-license)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
 👉 **Русская версия README:**

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import concurrent.futures
+import ipaddress
 import json
 import os
 import queue
@@ -18,8 +19,8 @@ import requests
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_TITLE = "Connectivity Tester"
-APP_VERSION = "v5.4"
+APP_TITLE = "DPI & Connectivity Tester"
+APP_VERSION = "v5.7"
 TIMEOUT = 10
 MAX_WORKERS = 4
 USER_AGENT = (
@@ -27,6 +28,65 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 SITES_FILENAME = "user_sites.txt"
+
+COUNTRY_CODE_TO_NAME = {
+    "CA": "Канада",
+    "CO": "Колумбия",
+    "DE": "Германия",
+    "ES": "Испания",
+    "FI": "Финляндия",
+    "FR": "Франция",
+    "LU": "Люксембург",
+    "NL": "Нидерланды",
+    "PL": "Польша",
+    "SE": "Швеция",
+    "SG": "Сингапур",
+    "UK": "Великобритания",
+    "US": "США",
+}
+
+
+def normalize_country_name(country_value: str) -> str:
+    value = (country_value or "").strip()
+    if not value:
+        return ""
+    upper_value = value.upper()
+    if len(upper_value) == 2:
+        return COUNTRY_CODE_TO_NAME.get(upper_value, upper_value)
+    return value
+
+
+def infer_country_from_site_id(site_id: str) -> str:
+    prefix = (site_id or "").split(".", 1)[0].strip().upper()
+    if len(prefix) == 2:
+        return COUNTRY_CODE_TO_NAME.get(prefix, prefix)
+    return ""
+
+
+def normalize_location_text(location_value: str, country_hint: str = "") -> str:
+    value = (location_value or "").strip()
+    if not value:
+        normalized_hint = normalize_country_name(country_hint)
+        return normalized_hint or ""
+
+    parts = []
+    for part in value.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        if len(cleaned) == 2 and cleaned.upper() in COUNTRY_CODE_TO_NAME:
+            cleaned = COUNTRY_CODE_TO_NAME[cleaned.upper()]
+        parts.append(cleaned)
+
+    normalized = ", ".join(parts).strip()
+    if len(normalized) == 2 and normalized.upper() in COUNTRY_CODE_TO_NAME:
+        normalized = COUNTRY_CODE_TO_NAME[normalized.upper()]
+
+    if normalized:
+        return normalized
+
+    normalized_hint = normalize_country_name(country_hint)
+    return normalized_hint or ""
 
 REMOTE_SUITE_URL = "https://raw.githubusercontent.com/hyperion-cs/dpi-checkers/refs/heads/main/ru/tcp-16-20/suite.json"
 REMOTE_HOSTS_URL = "https://raw.githubusercontent.com/hyperion-cs/dpi-checkers/refs/heads/main/ru/tcp-16-20/suite.v2.json"
@@ -220,6 +280,12 @@ DPI (разрыв при скачивании):
     или показываться приблизительно.
   - Это нормально для некоторых CDN, балансировщиков, Anycast-узлов и защитных сетей.
 
+FakeIP / DNS-прокси:
+  - Если DNS возвращает IP из специальных диапазонов (например 198.18.x.x),
+    это обычно означает работу FakeIP, DNS-прокси или VPN-клиента.
+  - В таком режиме могут быть неточными IP-адрес, локация и часть прямых проверок по IP.
+  - Если при этом SSL и HTTP прошли успешно, сайт считается доступным.
+
 Стандартная проверка:
   - В начале списка добавлены пользовательские индикаторы доступности:
       Telegram Web
@@ -266,9 +332,13 @@ class SiteResult:
     verdict: str
     source_hint: str = ""
     order_index: int = 0
+    http_host: str = ""
+    http_ip: str = ""
+    notes: str = ""
 
 
 class ToolTip:
+
     def __init__(self, widget):
         self.widget = widget
         self.tipwindow = None
@@ -382,6 +452,7 @@ def fetch_remote_standard_suite() -> tuple[list[dict], str]:
                 combined["host"] = host_info["host"]
             if host_info.get("country") and not combined.get("country"):
                 combined["country"] = host_info["country"]
+            combined["country"] = normalize_country_name(combined.get("country", "") or infer_country_from_site_id(site_id))
             merged.append(combined)
 
         # Добавим только host-only записи, если они не self-check.
@@ -394,7 +465,7 @@ def fetch_remote_standard_suite() -> tuple[list[dict], str]:
                 {
                     "id": item.get("id", ""),
                     "provider": item.get("provider", "Сайт"),
-                    "country": item.get("country", ""),
+                    "country": normalize_country_name(item.get("country", "") or infer_country_from_site_id(site_id)),
                     "host": item.get("host", ""),
                     "url": f"https://{item.get('host', '')}/" if item.get("host") else "",
                 }
@@ -419,6 +490,7 @@ def build_bundled_standard_suite() -> list[dict]:
             combined["host"] = host_info["host"]
         if host_info.get("country") and not combined.get("country"):
             combined["country"] = host_info["country"]
+        combined["country"] = normalize_country_name(combined.get("country", "") or infer_country_from_site_id(site_id))
         merged.append(combined)
 
     for site_id, item in host_by_id.items():
@@ -428,7 +500,7 @@ def build_bundled_standard_suite() -> list[dict]:
             {
                 "id": item.get("id", ""),
                 "provider": item.get("provider", "Сайт"),
-                "country": item.get("country", ""),
+                "country": normalize_country_name(item.get("country", "") or infer_country_from_site_id(site_id)),
                 "host": item.get("host", ""),
                 "url": f"https://{item.get('host', '')}/" if item.get("host") else "",
             }
@@ -437,137 +509,448 @@ def build_bundled_standard_suite() -> list[dict]:
     return PRIORITY_SITES + merged
 
 
-def test_dns(hostname: str):
-    resolver = dns.resolver.Resolver()
-    resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
-    resolver.lifetime = TIMEOUT
-    start_time = time.monotonic()
+
+
+LOCAL_DOMAIN_SUFFIXES = (".lan", ".local", ".home", ".internal", ".arpa")
+
+
+def is_ip_literal(value: str) -> bool:
     try:
-        answers = resolver.resolve(hostname)
-        ip_address = answers[0].to_text()
-        duration = time.monotonic() - start_time
-        return f"OK ({ip_address})", f"{duration:.3f} с", ip_address
-    except Exception as exc:
-        duration = time.monotonic() - start_time
-        return f"Ошибка ({exc.__class__.__name__})", f"{duration:.3f} с", None
+        ipaddress.ip_address((value or "").strip())
+        return True
+    except ValueError:
+        return False
 
 
-def get_ip_location(ip_address: str | None, country_hint: str = "") -> str:
-    if not ip_address:
-        return country_hint or "Не удалось определить"
+def host_looks_public(hostname: str) -> bool:
+    host = (hostname or "").strip().rstrip(".").lower()
+    if not host or is_ip_literal(host):
+        return False
+    if "." not in host:
+        return False
+    if host.endswith(LOCAL_DOMAIN_SUFFIXES):
+        return False
+    return True
 
-    services = [
-        (f"http://ip-api.com/json/{ip_address}?fields=status,country,regionName,city", ("country", "regionName", "city"), "status", "success"),
-        (f"https://ipwho.is/{ip_address}", ("country", "region", "city"), "success", True),
-    ]
 
-    for url, fields, ok_key, ok_value in services:
+def is_special_ip_for_public_host(ip_value: str | None, hostname: str) -> bool:
+    if not ip_value or not host_looks_public(hostname):
+        return False
+    try:
+        return not ipaddress.ip_address(ip_value).is_global
+    except ValueError:
+        return False
+
+
+def choose_preferred_ip(ip_values: list[str]) -> str | None:
+    if not ip_values:
+        return None
+
+    unique_ips: list[str] = []
+    for ip_value in ip_values:
+        if ip_value and ip_value not in unique_ips:
+            unique_ips.append(ip_value)
+
+    global_ipv4: list[str] = []
+    global_ipv6: list[str] = []
+    other_ips: list[str] = []
+
+    for ip_value in unique_ips:
         try:
-            response = requests.get(url, timeout=5, headers={"User-Agent": USER_AGENT})
-            response.raise_for_status()
-            data = response.json()
-            if data.get(ok_key) != ok_value:
-                continue
-            parts = []
-            for field in fields:
-                value = data.get(field, "")
-                if value and value not in parts:
-                    parts.append(value)
-            location = ", ".join(parts)
-            if location:
-                return location
-        except Exception:
+            parsed = ipaddress.ip_address(ip_value)
+        except ValueError:
             continue
+        if parsed.is_global:
+            if parsed.version == 4:
+                global_ipv4.append(ip_value)
+            else:
+                global_ipv6.append(ip_value)
+        else:
+            other_ips.append(ip_value)
 
-    return country_hint or "Не удалось определить"
+    return (global_ipv4 or global_ipv6 or other_ips or [None])[0]
 
 
-def test_tls_version(host: str, ip: str | None, port: int, version_enum: ssl.TLSVersion) -> str:
+def resolve_with_resolver(hostname: str, nameservers: list[str] | None = None) -> tuple[list[str], list[str]]:
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = TIMEOUT
+    resolver.timeout = min(TIMEOUT, 5)
+    if nameservers:
+        resolver.nameservers = nameservers
+
+    ips: list[str] = []
+    errors: list[str] = []
+
+    for record_type in ("A", "AAAA"):
+        try:
+            answers = resolver.resolve(hostname, record_type)
+            for answer in answers:
+                value = answer.to_text().strip()
+                if value and value not in ips:
+                    ips.append(value)
+        except Exception as exc:
+            errors.append(exc.__class__.__name__)
+
+    return ips, errors
+
+
+def resolve_with_system_dns(hostname: str) -> tuple[list[str], list[str]]:
+    ips: list[str] = []
+    errors: list[str] = []
+    try:
+        info = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        for item in info:
+            sockaddr = item[4]
+            if not sockaddr:
+                continue
+            ip_value = sockaddr[0]
+            if ip_value and ip_value not in ips:
+                ips.append(ip_value)
+    except Exception as exc:
+        errors.append(exc.__class__.__name__)
+    return ips, errors
+
+
+def build_http_target(parsed_url) -> str:
+    target = parsed_url.path or "/"
+    if parsed_url.params:
+        target = f"{target};{parsed_url.params}"
+    if parsed_url.query:
+        target = f"{target}?{parsed_url.query}"
+    return target or "/"
+
+
+def build_host_header(hostname: str, scheme: str, port: int) -> str:
+    default_port = 443 if scheme == "https" else 80
+    if port == default_port:
+        return hostname
+    return f"{hostname}:{port}"
+
+
+def read_http_response_headers(sock: socket.socket) -> tuple[int, dict[str, str], bytes]:
+    buffer = b""
+    max_header_size = 64 * 1024
+
+    while b"\r\n\r\n" not in buffer:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buffer += chunk
+        if len(buffer) > max_header_size:
+            raise ValueError("HeaderTooLarge")
+
+    if b"\r\n\r\n" not in buffer:
+        raise ValueError("IncompleteHeaders")
+
+    header_bytes, remainder = buffer.split(b"\r\n\r\n", 1)
+    header_text = header_bytes.decode("iso-8859-1", errors="replace")
+    lines = header_text.split("\r\n")
+    if not lines:
+        raise ValueError("EmptyStatusLine")
+
+    status_line = lines[0]
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError("InvalidStatusLine")
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+
+    status_code = int(parts[1])
+    return status_code, headers, remainder
+
+
+def open_http_socket(ip_value: str, port: int, hostname: str, use_ssl: bool):
+    raw_sock = socket.create_connection((ip_value, port), timeout=TIMEOUT)
+    raw_sock.settimeout(TIMEOUT)
+    if not use_ssl:
+        return raw_sock, raw_sock
+
+    context = ssl.create_default_context()
+    wrapped_sock = context.wrap_socket(raw_sock, server_hostname=hostname)
+    wrapped_sock.settimeout(TIMEOUT)
+    return raw_sock, wrapped_sock
+
+
+def classify_http_exception(exc: Exception) -> tuple[str, str]:
+    name = exc.__class__.__name__
+    dpi_like_errors = {
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "RemoteDisconnected",
+        "SSLEOFError",
+        "SSLError",
+        "BrokenPipeError",
+    }
+    timeout_like_errors = {
+        "TimeoutError",
+        "socket.timeout",
+        "Timeout",
+        "ReadTimeout",
+    }
+
+    if name in dpi_like_errors:
+        return name, "dpi_like"
+    if name in timeout_like_errors or isinstance(exc, (TimeoutError, socket.timeout)):
+        return name, "timeout"
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return name, "cert"
+    return name, "other"
+
+
+def test_dns(hostname: str) -> dict:
+    start_time = time.monotonic()
+
+    public_ips, public_errors = resolve_with_resolver(hostname, nameservers=["1.1.1.1", "8.8.8.8"])
+    ip_address = choose_preferred_ip(public_ips)
+    resolver_source = "public"
+    system_fallback_used = False
+
+    if not ip_address:
+        system_ips, system_errors = resolve_with_system_dns(hostname)
+        ip_address = choose_preferred_ip(system_ips)
+        if ip_address:
+            resolver_source = "system"
+            system_fallback_used = True
+            public_errors.extend(system_errors)
+        else:
+            errors = public_errors + system_errors
+            duration = time.monotonic() - start_time
+            error_name = errors[0] if errors else "DNSFailure"
+            return {
+                "text": f"Ошибка ({error_name})",
+                "time": f"{duration:.3f} с",
+                "ip": None,
+                "ok": False,
+                "resolver_source": "none",
+                "system_fallback_used": False,
+                "fake_ip": False,
+                "error": error_name,
+            }
+
+    duration = time.monotonic() - start_time
+    fake_ip = is_special_ip_for_public_host(ip_address, hostname)
+    if system_fallback_used:
+        text = f"OK ({ip_address}) ⚠️"
+    else:
+        text = f"OK ({ip_address})"
+
+    if fake_ip:
+        text = f"{text} ⚠️ FakeIP/спецдиапазон"
+
+    return {
+        "text": text,
+        "time": f"{duration:.3f} с",
+        "ip": ip_address,
+        "ok": True,
+        "resolver_source": resolver_source,
+        "system_fallback_used": system_fallback_used,
+        "fake_ip": fake_ip,
+        "error": None,
+    }
+
+
+def test_tls_version(host: str, ip: str | None, port: int, version_enum: ssl.TLSVersion, enabled: bool = True) -> dict:
+    if not enabled:
+        return {"text": "Не применяется (HTTP URL)", "ok": False, "skipped": True, "error": None}
     if not ip:
-        return "Пропуск (нет IP)"
+        return {"text": "Пропуск (нет IP)", "ok": False, "skipped": True, "error": "NoIP"}
+
     context = ssl.create_default_context()
     context.minimum_version = version_enum
     context.maximum_version = version_enum
+
     try:
         with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=host):
-                return "OK ✅"
+                return {"text": "OK ✅", "ok": True, "skipped": False, "error": None}
     except Exception as exc:
-        return f"Blocked ❌ ({exc.__class__.__name__})"
+        error_name, _ = classify_http_exception(exc)
+        return {"text": f"Blocked ❌ ({error_name})", "ok": False, "skipped": False, "error": error_name}
 
 
-def test_ssl_handshake(host: str, ip: str | None, port: int):
+def test_ssl_handshake(host: str, ip: str | None, port: int, enabled: bool = True) -> dict:
+    if not enabled:
+        return {"text": "Не применяется (HTTP URL)", "time": "N/A", "ok": False, "skipped": True, "error": None, "cert_mitm": False, "timeout": False}
     if not ip:
-        return "Пропуск (нет IP)", "N/A"
+        return {"text": "Пропуск (нет IP)", "time": "N/A", "ok": False, "skipped": True, "error": "NoIP", "cert_mitm": False, "timeout": False}
+
     context = ssl.create_default_context()
     start_time = time.monotonic()
     try:
         with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=host):
                 duration = time.monotonic() - start_time
-                return "OK ✅", f"{duration:.3f} с"
-    except ssl.SSLCertVerificationError:
+                return {"text": "OK ✅", "time": f"{duration:.3f} с", "ok": True, "skipped": False, "error": None, "cert_mitm": False, "timeout": False}
+    except ssl.SSLCertVerificationError as exc:
         duration = time.monotonic() - start_time
-        return "Подмена сертификата ❌", f"{duration:.3f} с"
+        return {"text": "Подмена сертификата ❌", "time": f"{duration:.3f} с", "ok": False, "skipped": False, "error": exc.__class__.__name__, "cert_mitm": True, "timeout": False}
     except Exception as exc:
         duration = time.monotonic() - start_time
-        return f"Ошибка ({exc.__class__.__name__}) ❌", f"{duration:.3f} с"
+        error_name, category = classify_http_exception(exc)
+        return {
+            "text": f"Ошибка ({error_name}) ❌",
+            "time": f"{duration:.3f} с",
+            "ok": False,
+            "skipped": False,
+            "error": error_name,
+            "cert_mitm": False,
+            "timeout": category == "timeout",
+        }
 
 
-def test_http_get(url: str):
+def test_http_get(url: str, host: str, ip: str | None, port: int, use_ssl: bool) -> dict:
+    if not ip:
+        return {"text": "Ошибка (NoIP) ❌", "time": "N/A", "ok": False, "accessible": False, "status_code": None, "error": "NoIP", "category": "other"}
+
+    parsed_url = urlparse(url)
+    request_target = build_http_target(parsed_url)
+    host_header = build_host_header(host, parsed_url.scheme or ("https" if use_ssl else "http"), port)
+    request_bytes = (
+        f"GET {request_target} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"User-Agent: {USER_AGENT}\r\n"
+        "Accept: */*\r\n"
+        "Accept-Encoding: identity\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+
+    start_time = time.monotonic()
+    raw_sock = None
+    io_sock = None
     try:
-        response = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, allow_redirects=True)
-        duration = response.elapsed.total_seconds()
-        if 200 <= response.status_code <= 299:
-            return f"OK ({response.status_code}) ✅", f"{duration:.3f} с"
-        return f"OK ({response.status_code}) ⚠️", f"{duration:.3f} с"
-    except requests.exceptions.RequestException as exc:
-        return f"Ошибка ({exc.__class__.__name__}) ❌", "N/A"
+        raw_sock, io_sock = open_http_socket(ip, port, host, use_ssl)
+        io_sock.sendall(request_bytes)
+        status_code, _headers, _remainder = read_http_response_headers(io_sock)
+        duration = time.monotonic() - start_time
+        if 200 <= status_code <= 299:
+            text = f"OK ({status_code}) ✅"
+        else:
+            text = f"OK ({status_code}) ⚠️"
+        return {
+            "text": text,
+            "time": f"{duration:.3f} с",
+            "ok": True,
+            "accessible": True,
+            "status_code": status_code,
+            "error": None,
+            "category": "ok",
+        }
+    except Exception as exc:
+        duration = time.monotonic() - start_time
+        error_name, category = classify_http_exception(exc)
+        return {
+            "text": f"Ошибка ({error_name}) ❌",
+            "time": f"{duration:.3f} с" if duration > 0 else "N/A",
+            "ok": False,
+            "accessible": False,
+            "status_code": None,
+            "error": error_name,
+            "category": category,
+        }
+    finally:
+        try:
+            if io_sock and io_sock is not raw_sock:
+                io_sock.close()
+        except Exception:
+            pass
+        try:
+            if raw_sock:
+                raw_sock.close()
+        except Exception:
+            pass
 
 
-def test_dpi_download(url: str, threshold_bytes: int = 65536):
-    safe_threshold = max(threshold_bytes, 16 * 1024)
+def test_dpi_download(url: str, host: str, ip: str | None, port: int, use_ssl: bool, threshold_bytes: int = 65536) -> dict:
+    if not ip:
+        return {"text": "Не проверено (нет IP)", "detected": False, "limited": True, "category": "no_ip"}
+
+    safe_threshold = max(int(threshold_bytes or 65536), 16 * 1024)
+    parsed_url = urlparse(url)
+    request_target = build_http_target(parsed_url)
+    host_header = build_host_header(host, parsed_url.scheme or ("https" if use_ssl else "http"), port)
+    request_bytes = (
+        f"GET {request_target} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"User-Agent: {USER_AGENT}\r\n"
+        "Accept: */*\r\n"
+        "Accept-Encoding: identity\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+
+    raw_sock = None
+    io_sock = None
+    total = 0
     try:
-        with requests.get(url, stream=True, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, allow_redirects=True) as response:
-            status_code = response.status_code
-            if status_code >= 400:
-                return f"Не проверено (HTTP {status_code})"
+        raw_sock, io_sock = open_http_socket(ip, port, host, use_ssl)
+        io_sock.sendall(request_bytes)
+        status_code, _headers, remainder = read_http_response_headers(io_sock)
 
-            total = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total >= safe_threshold:
-                    return "Not detected ✅"
+        if status_code >= 400:
+            return {"text": f"Не проверено (HTTP {status_code})", "detected": False, "limited": True, "category": "http_status"}
 
-            if total < 16 * 1024:
-                return f"Не проверено (<16 KB, {total // 1024} KB)"
-            if 16 * 1024 <= total <= 24 * 1024:
-                return f"Detected❗️ ({total // 1024} KB)"
-            return "Not detected ✅"
-    except requests.exceptions.RequestException as exc:
-        return f"Detected❗️ ({exc.__class__.__name__})"
+        total = len(remainder)
+        while total < safe_threshold:
+            chunk = io_sock.recv(8192)
+            if not chunk:
+                break
+            total += len(chunk)
+
+        if total >= safe_threshold:
+            return {"text": "Not detected ✅", "detected": False, "limited": False, "category": "ok"}
+        if total < 16 * 1024:
+            return {"text": f"Не проверено (<16 KB, {total // 1024} KB)", "detected": False, "limited": True, "category": "too_small"}
+        if 16 * 1024 <= total <= 24 * 1024:
+            return {"text": f"Detected❗️ ({total // 1024} KB)", "detected": True, "limited": False, "category": "size_window"}
+        return {"text": "Not detected ✅", "detected": False, "limited": False, "category": "ok"}
+    except Exception as exc:
+        error_name, category = classify_http_exception(exc)
+        if total >= 16 * 1024:
+            return {"text": f"Detected❗️ ({error_name})", "detected": True, "limited": False, "category": category}
+        return {"text": f"Не проверено ({error_name})", "detected": False, "limited": True, "category": category}
+    finally:
+        try:
+            if io_sock and io_sock is not raw_sock:
+                io_sock.close()
+        except Exception:
+            pass
+        try:
+            if raw_sock:
+                raw_sock.close()
+        except Exception:
+            pass
 
 
-def determine_verdict(results: dict[str, str]) -> str:
-    ssl_text = results["ssl_status"]
-    http_text = results["http_status"]
-    dpi_text = results["dpi_download_status"]
+def determine_verdict(results: dict) -> str:
+    dns_result = results["dns"]
+    ssl_result = results["ssl"]
+    http_result = results["http"]
+    dpi_result = results["dpi"]
+    mixed_hosts = results.get("mixed_hosts", False)
 
-    if "Ошибка" in results["dns_status"]:
+    if not dns_result["ok"]:
         return "DNS-блокировка ❗️"
-    if "Подмена сертификата" in ssl_text:
+    if ssl_result["cert_mitm"]:
         return "Подмена SSL (DPI/MITM) ❗️"
-    if "Timeout" in ssl_text or "ReadTimeout" in ssl_text:
+    if ssl_result["timeout"]:
         return "Блокировка 'black-hole' ❗️"
-    if "Ошибка" in ssl_text:
+    if not ssl_result["skipped"] and not ssl_result["ok"]:
+        if mixed_hosts and http_result["ok"]:
+            return "Частичная проблема (DNS/TLS probe) ❗️"
         return "Блокировка по IP/SNI ❗️"
-    if "Ошибка" in http_text:
-        return "Блокировка по DPI (HTTP) ❗️"
-    if dpi_text.startswith("Detected"):
+    if not http_result["ok"]:
+        if http_result["category"] == "dpi_like":
+            return "Возможная блокировка по DPI (HTTP) ❗️"
+        if http_result["category"] == "timeout":
+            return "Ошибка HTTP / таймаут ❗️"
+        return "Ошибка HTTP ❗️"
+    if dpi_result["detected"]:
         return "DPI (разрыв при скачивании) ❗️"
-    if "Не проверено" in dpi_text:
+    if dpi_result["limited"]:
         return "Доступен ✅ (DPI-тест ограничен)"
     return "Доступен ✅"
 
@@ -586,7 +969,7 @@ def run_full_test_on_url(item, index: int = 0, total: int = 1) -> SiteResult:
         url = source_item.get("url", "")
         site_id = source_item.get("id", "")
         provider = source_item.get("provider", "")
-        country = source_item.get("country", "")
+        country = normalize_country_name(source_item.get("country", "") or infer_country_from_site_id(site_id))
         host_override = source_item.get("host", "")
         threshold_bytes = int(source_item.get("thresholdBytes", 65536) or 65536)
         source_hint = source_item.get("source_hint", "")
@@ -601,22 +984,54 @@ def run_full_test_on_url(item, index: int = 0, total: int = 1) -> SiteResult:
         source_hint = ""
 
     parsed_url = urlparse(url)
-    hostname = host_override or parsed_url.hostname or ""
-    if not url and hostname:
-        url = f"https://{hostname}/"
+    url_host = parsed_url.hostname or ""
+    probe_host = host_override or url_host
+    http_host = url_host or probe_host
+
+    if not url and probe_host:
+        url = f"https://{probe_host}/"
         parsed_url = urlparse(url)
+        http_host = parsed_url.hostname or probe_host
 
-    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+    scheme = (parsed_url.scheme or "https").lower()
+    is_https = scheme == "https"
+    port = parsed_url.port or (443 if is_https else 80)
 
-    results: dict[str, str] = {}
-    results["dns_status"], results["dns_time"], ip = test_dns(hostname)
-    results["location"] = get_ip_location(ip, country_hint=country)
-    results["tls13_status"] = test_tls_version(hostname, ip, port, ssl.TLSVersion.TLSv1_3)
-    results["tls12_status"] = test_tls_version(hostname, ip, port, ssl.TLSVersion.TLSv1_2)
-    results["ssl_status"], results["ssl_time"] = test_ssl_handshake(hostname, ip, port)
-    results["http_status"], results["http_time"] = test_http_get(url)
-    results["dpi_download_status"] = test_dpi_download(url, threshold_bytes=threshold_bytes)
-    results["verdict"] = determine_verdict(results)
+    dns_result = test_dns(probe_host)
+    probe_ip = dns_result["ip"]
+    mixed_hosts = bool(http_host and probe_host and http_host != probe_host)
+
+    if mixed_hosts:
+        http_dns_result = test_dns(http_host)
+        http_ip = http_dns_result["ip"]
+    else:
+        http_dns_result = dns_result
+        http_ip = probe_ip
+
+    location_text = normalize_location_text(get_ip_location(probe_ip, country_hint=country), country_hint=country)
+    tls13_result = test_tls_version(probe_host, probe_ip, port, ssl.TLSVersion.TLSv1_3, enabled=is_https)
+    tls12_result = test_tls_version(probe_host, probe_ip, port, ssl.TLSVersion.TLSv1_2, enabled=is_https)
+    ssl_result = test_ssl_handshake(probe_host, probe_ip, port, enabled=is_https)
+    http_result = test_http_get(url, http_host, http_ip, port, use_ssl=is_https)
+    dpi_result = test_dpi_download(url, http_host, http_ip, port, use_ssl=is_https, threshold_bytes=threshold_bytes)
+
+    notes: list[str] = []
+    if dns_result["system_fallback_used"]:
+        notes.append("Публичный DNS не ответил, использован системный DNS.")
+    if dns_result["fake_ip"]:
+        notes.append("DNS вернул IP из спецдиапазона. Это может делать неточными IP, локацию и часть прямых проверок по IP, но не отменяет успешный HTTP/SSL.")
+    if mixed_hosts:
+        notes.append(f"DNS/TLS/SSL проверялись по хосту {probe_host}, HTTP/DPI — по хосту {http_host}.")
+        if not http_dns_result["ok"]:
+            notes.append(f"HTTP-хост не удалось разрешить: {http_dns_result['text']}.")
+
+    result_meta = {
+        "dns": dns_result,
+        "ssl": ssl_result,
+        "http": http_result,
+        "dpi": dpi_result,
+        "mixed_hosts": mixed_hosts,
+    }
 
     return SiteResult(
         label=build_label(source_item if isinstance(item, dict) else {"id": site_id, "provider": provider}, index, total),
@@ -624,22 +1039,75 @@ def run_full_test_on_url(item, index: int = 0, total: int = 1) -> SiteResult:
         provider=provider,
         country=country,
         url=url,
-        host=hostname,
-        dns_status=results["dns_status"],
-        dns_time=results["dns_time"],
-        ip=ip or "N/A",
-        location=results["location"],
-        tls13_status=results["tls13_status"],
-        tls12_status=results["tls12_status"],
-        ssl_status=results["ssl_status"],
-        ssl_time=results["ssl_time"],
-        http_status=results["http_status"],
-        http_time=results["http_time"],
-        dpi_download_status=results["dpi_download_status"],
-        verdict=results["verdict"],
+        host=probe_host,
+        dns_status=dns_result["text"],
+        dns_time=dns_result["time"],
+        ip=probe_ip or "N/A",
+        location=location_text,
+        tls13_status=tls13_result["text"],
+        tls12_status=tls12_result["text"],
+        ssl_status=ssl_result["text"],
+        ssl_time=ssl_result["time"],
+        http_status=http_result["text"],
+        http_time=http_result["time"],
+        dpi_download_status=dpi_result["text"],
+        verdict=determine_verdict(result_meta),
         source_hint=source_hint,
         order_index=index,
+        http_host=http_host,
+        http_ip=http_ip or "N/A",
+        notes=" ".join(notes).strip(),
     )
+
+
+def get_ip_location(ip_address: str | None, country_hint: str = "") -> str:
+
+    normalized_hint = normalize_country_name(country_hint)
+
+    if not ip_address:
+        return normalized_hint or "Не удалось определить"
+
+    services = [
+        (f"http://ip-api.com/json/{ip_address}?fields=status,country,regionName,city,countryCode", ("country", "countryCode", "regionName", "city"), "status", "success"),
+        (f"https://ipwho.is/{ip_address}", ("country", "country_code", "region", "city"), "success", True),
+    ]
+
+    for url, fields, ok_key, ok_value in services:
+        try:
+            response = requests.get(url, timeout=5, headers={"User-Agent": USER_AGENT})
+            response.raise_for_status()
+            data = response.json()
+            if data.get(ok_key) != ok_value:
+                continue
+
+            parts = []
+            country_value = ""
+            for field in fields:
+                value = str(data.get(field, "") or "").strip()
+                if not value:
+                    continue
+
+                if field.lower() in {"country", "countrycode", "country_code"}:
+                    normalized_country = normalize_country_name(value)
+                    if normalized_country:
+                        country_value = normalized_country
+                    continue
+
+                if value not in parts:
+                    parts.append(value)
+
+            if country_value:
+                location = ", ".join([country_value] + parts)
+            else:
+                location = ", ".join(parts)
+
+            location = normalize_location_text(location, country_hint=normalized_hint)
+            if location:
+                return location
+        except Exception:
+            continue
+
+    return normalized_hint or "Не удалось определить"
 
 
 class DPIConnectivityApp:
@@ -879,6 +1347,8 @@ class DPIConnectivityApp:
             if "ограничен" in verdict:
                 return "limited"
             return "ok"
+        if "⚠️" in result.verdict or "частичная проблема" in verdict:
+            return "limited"
         return "issue"
 
     def _matches_filter(self, result: SiteResult) -> bool:
@@ -931,15 +1401,27 @@ class DPIConnectivityApp:
 
     def _format_result_details(self, result: SiteResult) -> str:
         source_line = f"Источник списка: {result.source_hint}\n" if result.source_hint else ""
+        http_host_line = ""
+        http_ip_line = ""
+        notes_line = f"Примечание: {result.notes}\n" if result.notes else ""
+
+        if result.http_host and result.http_host != result.host:
+            http_host_line = f"HTTP-хост:  {result.http_host}\n"
+        if result.http_ip and result.http_ip not in {"", "N/A"} and result.http_ip != result.ip:
+            http_ip_line = f"HTTP-IP:    {result.http_ip}\n"
+
         return (
             f"Метка:      {result.label}\n"
             f"ID:         {result.site_id}\n"
             f"Провайдер:  {result.provider or '—'}\n"
             f"URL:        {result.url}\n"
             f"Хост:       {result.host}\n"
+            f"{http_host_line}"
             f"IP:         {result.ip}\n"
-            f"Локация:    {result.location}\n"
-            f"{source_line}\n"
+            f"{http_ip_line}"
+            f"Локация:    {normalize_location_text(result.location, country_hint=result.country)}\n"
+            f"{source_line}"
+            f"{notes_line}\n"
             f"DNS:        {result.dns_status}, {result.dns_time}\n"
             f"TLS 1.3:    {result.tls13_status}\n"
             f"TLS 1.2:    {result.tls12_status}\n"
@@ -959,16 +1441,24 @@ class DPIConnectivityApp:
 
     def _tooltip_verdict_text(self, result: SiteResult) -> str:
         verdict = result.verdict.lower()
+        if "fakeip" in verdict or "dns-прокси" in verdict:
+            return "Домен разрешился в спецдиапазон или через DNS-прокси. Результат проверки может быть искажен VPN, FakeIP или локальным DNS."
         if "dns-блокировка" in verdict:
             return "Не удалось получить IP. Это похоже на проблему DNS или DNS-фильтрацию."
         if "подмена ssl" in verdict:
             return "Сертификат не доверенный. Возможна подмена сертификата или MITM."
+        if "частичная проблема" in verdict:
+            return "Один probe-хост не прошёл DNS/TLS-проверку, но HTTP-ресурс при этом отвечает. Проверьте, что в наборе не используются разные хосты."
         if "ip/sni" in verdict:
             return "DNS ответил, но SSL/TLS не установился. Похоже на блокировку по IP или SNI."
         if "dpi (разрыв" in verdict:
             return "Во время загрузки большого ответа соединение оборвалось. Это похоже на DPI-разрыв."
-        if "dpi (http)" in verdict:
-            return "TLS поднялся, но HTTP-запрос не прошёл. Это похоже на DPI по содержимому."
+        if "возможная блокировка по dpi" in verdict:
+            return "HTTP-соединение оборвалось уже после установки канала. Это похоже на DPI или принудительный сброс."
+        if "ошибка http / таймаут" in verdict:
+            return "HTTP-запрос не завершился вовремя. Это может быть таймаут маршрута, black-hole или нестабильная сеть."
+        if "ошибка http" in verdict:
+            return "HTTP-запрос завершился ошибкой, но по одному этому признаку нельзя уверенно назвать это DPI."
         if "black-hole" in verdict:
             return "Трафик к ресурсу, вероятно, молча отбрасывается без ответа."
         if "ограничен" in verdict:
@@ -1002,13 +1492,15 @@ class DPIConnectivityApp:
 
     def _explain_issue_line(self, lowered: str) -> str:
         patterns = [
+            (["fakeip", "спецдиапазон"], "Домен разрешился в специальный IP-диапазон. Часто это означает FakeIP, DNS-прокси или влияние VPN."),
             (["nxdomain"], "Такой домен не найден через DNS."),
             (["lifetimeout", "dns timeout"], "DNS-сервер не ответил вовремя. Возможна фильтрация DNS-запросов."),
+            (["публичный dns не ответил"], "Публичный DNS не ответил, поэтому приложение перешло на системный DNS."),
             (["timeout", "readtimeout", "connecttimeout"], "Сервер не ответил вовремя. Возможен black-hole или сильная фильтрация."),
             (["sslcertverificationerror", "подмена сертификата"], "Ошибка проверки сертификата. Возможна подмена сертификата или MITM."),
             (["ssl error", "sslerror", "ssl_error"], "Ошибка SSL/TLS. Соединение не удалось согласовать или защитить."),
             (["wrong version number"], "Сервер отверг согласование версии TLS."),
-            (["eof occurred in violation of protocol"], "Соединение оборвалось во время TLS-рукопожатия."),
+            (["eof occurred in violation of protocol", "ssleoferror"], "Соединение оборвалось во время TLS-рукопожатия или уже после него."),
             (["certificate verify failed"], "Сертификат не прошёл проверку доверия."),
             (["connectionreseterror"], "Соединение было сброшено. Часто бывает при блокировке по IP/SNI или DPI."),
             (["connectionabortederror"], "Соединение было прервано до нормального завершения."),
@@ -1017,7 +1509,8 @@ class DPIConnectivityApp:
             (["remote end closed connection", "remotedisconnected"], "Удалённая сторона закрыла соединение без полного ответа."),
             (["не проверено (http"], "Сайт ответил HTTP-кодом, который не подходит для DPI-проверки по скачиванию."),
             (["не проверено (<16 kb"], "Ответ получен, но он слишком маленький для DPI-проверки по объёму."),
-            (["detected❗️", "chunkedencodingerror"], "Поток оборвался во время скачивания. Это похоже на DPI-разрыв или нестабильный маршрут."),
+            (["не проверено (нет ip)"], "DPI-проверка пропущена, потому что IP для HTTP-хоста не был получен."),
+            (["detected❗️"], "Поток оборвался во время скачивания или размер ответа попал в характерное окно 16–24 КБ."),
             (["blocked ❌"], "Соединение с этой версией TLS не удалось установить."),
             (["ok ⚠️"], "HTTP ответил, но код ответа не из 2xx. Базовая доступность есть, но ответ нестандартный."),
         ]
@@ -1028,11 +1521,11 @@ class DPIConnectivityApp:
 
     def _text_has_issue(self, text: str) -> bool:
         lowered = text.lower()
-        success_markers = ["ok (", "ok ✅", "доступен ✅", "не проверено", "not detected"]
+        success_markers = ["ok (", "ok ✅", "доступен ✅", "не проверено", "not detected", "не применяется"]
         issue_markers = [
             "ошибка", "подмена", "blocked", "detected", "timeout", "nxdomain",
             "connection", "black-hole", "mitm", "refused", "aborted", "closed",
-            "ssl error", "sslerror",
+            "ssl error", "sslerror", "fakeip", "спецдиапазон",
         ]
         if any(marker in lowered for marker in issue_markers):
             return True
@@ -1074,7 +1567,7 @@ class DPIConnectivityApp:
             return
 
         explanation = self._explain_text(line_text)
-        if not explanation and line_text.startswith(("Метка:", "ID:", "Провайдер:", "URL:", "Хост:", "IP:", "Локация:", "Источник списка:")):
+        if not explanation and line_text.startswith(("Метка:", "ID:", "Провайдер:", "URL:", "Хост:", "HTTP-хост:", "IP:", "HTTP-IP:", "Локация:", "Источник списка:", "Примечание:")):
             selected = self.tree.selection()
             if selected:
                 result = self.result_by_row.get(selected[0])
